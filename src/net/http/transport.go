@@ -1356,6 +1356,12 @@ func (w persistConnWriter) Write(p []byte) (n int, err error) {
 	return
 }
 
+func (w persistConnWriter) ReadFrom(r io.Reader) (n int64, err error) {
+	n, err = io.Copy(w.pc.conn, r)
+	w.pc.nwrite += n
+	return
+}
+
 // connectMethod is the map key (in its String form) for keeping persistent
 // TCP connections alive for subsequent HTTP requests.
 //
