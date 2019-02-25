@@ -5059,3 +5059,168 @@ func TestTransportRequestReplayable(t *testing.T) {
 		})
 	}
 }
+
+// testMockTCPConn is a mock TCP connection used to trace calls to
+// ReadFrom, namely to test that it's being called during request
+// body writes.
+type testMockTCPConn struct {
+	*net.TCPConn
+
+	ReadFromCalled bool
+
+	// An *os.File should be the ultimate reader when the caller is
+	// sending a file. This logs the info of that file.
+	ActualInfo os.FileInfo
+}
+
+func (c *testMockTCPConn) ReadFrom(r io.Reader) (int64, error) {
+	if !c.ReadFromCalled {
+		c.ReadFromCalled = true
+
+		var ar io.Reader
+		if lw, ok := r.(*io.LimitedReader); ok {
+			ar = lw.R
+		} else {
+			ar = r
+		}
+
+		if f, ok := ar.(*os.File); ok {
+			fi, err := f.Stat()
+			if err != nil {
+				panic(fmt.Errorf("testMockTCPConn.ReadFrom: error getting file info: %s", err))
+			}
+
+			c.ActualInfo = fi
+		}
+	}
+
+	return c.TCPConn.ReadFrom(r)
+}
+
+func TestTransportRequestBodyCallsReadFrom(t *testing.T) {
+	cases := []struct {
+		Name string
+
+		// Non-file type and chunking tests.
+		Buffer            bool
+		SkipContentLength bool
+	}{
+		{
+			Name: "basic",
+		},
+		{
+			Name:   "buffer",
+			Buffer: true,
+		},
+		{
+			Name:              "chunked",
+			SkipContentLength: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			tConn := &testMockTCPConn{}
+			trFunc := func(tr *Transport) {
+				tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+					var d net.Dialer
+					conn, err := d.DialContext(ctx, network, addr)
+					if err != nil {
+						return nil, err
+					}
+
+					tcpConn, ok := conn.(*net.TCPConn)
+					if !ok {
+						return nil, fmt.Errorf("%s/%s is not a TCP connection", network, addr)
+					}
+
+					tConn.TCPConn = tcpConn
+					return tConn, nil
+				}
+			}
+
+			cst := newClientServerTest(
+				t,
+				h1Mode,
+				HandlerFunc(func(w ResponseWriter, r *Request) {
+					io.Copy(ioutil.Discard, r.Body)
+					r.Body.Close()
+					w.WriteHeader(200)
+				}),
+				trFunc,
+			)
+			defer cst.close()
+
+			f, err := ioutil.TempFile("", "net-http-test")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			defer os.Remove(f.Name())
+
+			// 1K zeros just to get a file that we can read
+			_, err = f.Write(make([]byte, 1024))
+			f.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			f, err = os.Open(f.Name())
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			defer f.Close()
+
+			fi, err := f.Stat()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var r io.Reader
+			if tc.Buffer {
+				buf, err := ioutil.ReadAll(f)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				r = bytes.NewBuffer(buf)
+			} else {
+				r = f
+			}
+
+			req, err := NewRequest("PUT", cst.ts.URL, r)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if !tc.SkipContentLength {
+				req.ContentLength = fi.Size()
+			}
+
+			req.Header.Set("Content-Type", "application/octet-stream")
+
+			resp, err := cst.c.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			defer resp.Body.Close()
+			if resp.StatusCode != 200 {
+				t.Fatalf("status code = %d; want 200", resp.StatusCode)
+			}
+
+			if !tConn.ReadFromCalled {
+				t.Fatalf("ReadFrom never called during request body write")
+			}
+
+			if tConn.ActualInfo == nil {
+				t.Fatalf("no file info was logged during request body write")
+			}
+
+			if !reflect.DeepEqual(fi, tConn.ActualInfo) {
+				t.Fatalf("file info mismatch: expected %#v, got %#v", fi, tConn.ActualInfo)
+			}
+		})
+	}
+}
