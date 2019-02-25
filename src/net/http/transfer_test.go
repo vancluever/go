@@ -98,17 +98,20 @@ type mockTransferWriterBodyWriter struct {
 	WriteCalled  bool
 }
 
-func (w *mockTransferWriterBodyWriter) Write(p []byte) (int, error) {
-	w.WriteCalled = true
-	return ioutil.Discard.Write(p)
-}
-
 func (w *mockTransferWriterBodyWriter) ReadFrom(r io.Reader) (int64, error) {
 	w.CalledReader = r
 	return io.Copy(ioutil.Discard, r)
 }
 
+func (w *mockTransferWriterBodyWriter) Write(p []byte) (int, error) {
+	w.WriteCalled = true
+	return ioutil.Discard.Write(p)
+}
+
 func TestTransferWriterWriteBodyReaderTypes(t *testing.T) {
+	fileTyp := reflect.TypeOf(&os.File{})
+	bufferTyp := reflect.TypeOf(&bytes.Buffer{})
+
 	newFileFunc := func() (io.Reader, func(), error) {
 		f, err := ioutil.TempFile("", "net-http-test-transferwriter")
 		if err != nil {
@@ -133,9 +136,14 @@ func TestTransferWriterWriteBodyReaderTypes(t *testing.T) {
 		}, nil
 	}
 
+	newBufferFunc := func() (io.Reader, func(), error) {
+		return bytes.NewBuffer(make([]byte, 1024)), func() {}, nil
+	}
+
 	cases := []struct {
 		Name             string
 		BodyFunc         func() (io.Reader, func(), error)
+		Method           string
 		ContentLength    int64
 		TransferEncoding []string
 		LimitedReader    bool
@@ -143,31 +151,82 @@ func TestTransferWriterWriteBodyReaderTypes(t *testing.T) {
 		ExpectedWrite    bool
 	}{
 		{
-			Name:           "non-chunked, size set",
+			Name:           "file, non-chunked, size set",
 			BodyFunc:       newFileFunc,
+			Method:         "PUT",
 			ContentLength:  1024,
 			LimitedReader:  true,
-			ExpectedReader: reflect.TypeOf(&os.File{}),
+			ExpectedReader: fileTyp,
 		},
 		{
-			Name: "non-chunked, size set, nopCloser wrapped",
+			Name:   "file, non-chunked, size set, nopCloser wrapped",
+			Method: "PUT",
 			BodyFunc: func() (io.Reader, func(), error) {
 				r, cleanup, err := newFileFunc()
 				return ioutil.NopCloser(r), cleanup, err
 			},
 			ContentLength:  1024,
 			LimitedReader:  true,
-			ExpectedReader: reflect.TypeOf(&os.File{}),
+			ExpectedReader: fileTyp,
 		},
 		{
-			Name:          "non-chunked, negative size",
-			BodyFunc:      newFileFunc,
+			Name:           "file, non-chunked, negative size",
+			Method:         "PUT",
+			BodyFunc:       newFileFunc,
+			ContentLength:  -1,
+			ExpectedReader: fileTyp,
+		},
+		{
+			Name:           "file, non-chunked, CONNECT, negative size",
+			Method:         "CONNECT",
+			BodyFunc:       newFileFunc,
+			ContentLength:  -1,
+			ExpectedReader: fileTyp,
+		},
+		{
+			Name:             "file, chunked",
+			Method:           "PUT",
+			BodyFunc:         newFileFunc,
+			TransferEncoding: []string{"chunked"},
+			ExpectedWrite:    true,
+		},
+		{
+			Name:           "buffer, non-chunked, size set",
+			BodyFunc:       newBufferFunc,
+			Method:         "PUT",
+			ContentLength:  1024,
+			LimitedReader:  true,
+			ExpectedReader: bufferTyp,
+		},
+		{
+			Name:   "buffer, non-chunked, size set, nopCloser wrapped",
+			Method: "PUT",
+			BodyFunc: func() (io.Reader, func(), error) {
+				r, cleanup, err := newBufferFunc()
+				return ioutil.NopCloser(r), cleanup, err
+			},
+			ContentLength:  1024,
+			LimitedReader:  true,
+			ExpectedReader: bufferTyp,
+		},
+		{
+			Name:          "buffer, non-chunked, negative size",
+			Method:        "PUT",
+			BodyFunc:      newBufferFunc,
 			ContentLength: -1,
 			ExpectedWrite: true,
 		},
 		{
-			Name:             "chunked",
-			BodyFunc:         newFileFunc,
+			Name:          "buffer, non-chunked, CONNECT, negative size",
+			Method:        "CONNECT",
+			BodyFunc:      newBufferFunc,
+			ContentLength: -1,
+			ExpectedWrite: true,
+		},
+		{
+			Name:             "buffer, chunked",
+			Method:           "PUT",
+			BodyFunc:         newBufferFunc,
 			TransferEncoding: []string{"chunked"},
 			ExpectedWrite:    true,
 		},
