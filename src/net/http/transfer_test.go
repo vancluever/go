@@ -9,6 +9,8 @@ import (
 	"bytes"
 	"io"
 	"io/ioutil"
+	"os"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -88,5 +90,130 @@ func TestDetectInMemoryReaders(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("%d: got = %v; want %v", i, got, tt.want)
 		}
+	}
+}
+
+type mockTransferWriterBodyWriter struct {
+	CalledReader io.Reader
+	WriteCalled  bool
+}
+
+func (w *mockTransferWriterBodyWriter) Write(p []byte) (int, error) {
+	w.WriteCalled = true
+	return ioutil.Discard.Write(p)
+}
+
+func (w *mockTransferWriterBodyWriter) ReadFrom(r io.Reader) (int64, error) {
+	w.CalledReader = r
+	return io.Copy(ioutil.Discard, r)
+}
+
+func TestTransferWriterWriteBodyReaderTypes(t *testing.T) {
+	newFileFunc := func() (io.Reader, func(), error) {
+		f, err := ioutil.TempFile("", "net-http-test-transferwriter")
+		if err != nil {
+			return nil, nil, err
+		}
+
+		// 1K zeros just to get a file that we can read
+		_, err = f.Write(make([]byte, 1024))
+		f.Close()
+		if err != nil {
+			return nil, nil, err
+		}
+
+		f, err = os.Open(f.Name())
+		if err != nil {
+			return nil, nil, err
+		}
+
+		return f, func() {
+			f.Close()
+			os.Remove(f.Name())
+		}, nil
+	}
+
+	cases := []struct {
+		Name             string
+		BodyFunc         func() (io.Reader, func(), error)
+		ContentLength    int64
+		TransferEncoding []string
+		LimitedReader    bool
+		ExpectedReader   reflect.Type
+		ExpectedWrite    bool
+	}{
+		{
+			Name:           "non-chunked, size set",
+			BodyFunc:       newFileFunc,
+			ContentLength:  1024,
+			LimitedReader:  true,
+			ExpectedReader: reflect.TypeOf(&os.File{}),
+		},
+		{
+			Name: "non-chunked, size set, nopCloser wrapped",
+			BodyFunc: func() (io.Reader, func(), error) {
+				r, cleanup, err := newFileFunc()
+				return ioutil.NopCloser(r), cleanup, err
+			},
+			ContentLength:  1024,
+			LimitedReader:  true,
+			ExpectedReader: reflect.TypeOf(&os.File{}),
+		},
+		{
+			Name:          "non-chunked, negative size",
+			BodyFunc:      newFileFunc,
+			ContentLength: -1,
+			ExpectedWrite: true,
+		},
+		{
+			Name:             "chunked",
+			BodyFunc:         newFileFunc,
+			TransferEncoding: []string{"chunked"},
+			ExpectedWrite:    true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			body, cleanup, err := tc.BodyFunc()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			defer cleanup()
+
+			mw := &mockTransferWriterBodyWriter{}
+			tw := &transferWriter{
+				Body:             body,
+				ContentLength:    tc.ContentLength,
+				TransferEncoding: tc.TransferEncoding,
+			}
+
+			if err := tw.writeBody(mw); err != nil {
+				t.Fatal(err)
+			}
+
+			if tc.ExpectedReader != nil {
+				if mw.CalledReader == nil {
+					t.Fatal("expected ReadFrom to be called, but it wasn't")
+				}
+
+				var actualReader reflect.Type
+				lr, ok := mw.CalledReader.(*io.LimitedReader)
+				if ok && tc.LimitedReader {
+					actualReader = reflect.TypeOf(lr.R)
+				} else {
+					actualReader = reflect.TypeOf(mw.CalledReader)
+				}
+
+				if tc.ExpectedReader != actualReader {
+					t.Fatalf("expected reader to be %s, got %s", tc.ExpectedReader, actualReader)
+				}
+			}
+
+			if tc.ExpectedWrite && !mw.WriteCalled {
+				t.Fatal("expected Read to be called, but it wasn't")
+			}
+		})
 	}
 }
