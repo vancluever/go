@@ -5067,59 +5067,88 @@ type testMockTCPConn struct {
 	*net.TCPConn
 
 	ReadFromCalled bool
-
-	// An *os.File should be the ultimate reader when the caller is
-	// sending a file. This logs the info of that file.
-	ActualInfo os.FileInfo
 }
 
 func (c *testMockTCPConn) ReadFrom(r io.Reader) (int64, error) {
-	if !c.ReadFromCalled {
-		c.ReadFromCalled = true
-
-		var ar io.Reader
-		if lw, ok := r.(*io.LimitedReader); ok {
-			ar = lw.R
-		} else {
-			ar = r
-		}
-
-		if f, ok := ar.(*os.File); ok {
-			fi, err := f.Stat()
-			if err != nil {
-				panic(fmt.Errorf("testMockTCPConn.ReadFrom: error getting file info: %s", err))
-			}
-
-			c.ActualInfo = fi
-		}
-	}
-
+	c.ReadFromCalled = true
 	return c.TCPConn.ReadFrom(r)
 }
 
-func TestTransportRequestBodyCallsReadFrom(t *testing.T) {
-	cases := []struct {
-		Name string
+func TestTransportRequestWriteRoundTrip(t *testing.T) {
+	newFileFunc := func() (io.Reader, func(), error) {
+		f, err := ioutil.TempFile("", "net-http-testtransportrequestwriteroundtrip")
+		if err != nil {
+			return nil, nil, err
+		}
 
-		// Non-file type and chunking tests.
-		Buffer            bool
-		SkipContentLength bool
+		// 1K zeros just to get a file that we can read
+		_, err = f.Write(make([]byte, 1024))
+		f.Close()
+		if err != nil {
+			return nil, nil, err
+		}
+
+		f, err = os.Open(f.Name())
+		if err != nil {
+			return nil, nil, err
+		}
+
+		return f, func() {
+			f.Close()
+			os.Remove(f.Name())
+		}, nil
+	}
+
+	newBufferFunc := func() (io.Reader, func(), error) {
+		return bytes.NewBuffer(make([]byte, 1024)), func() {}, nil
+	}
+
+	cases := []struct {
+		Name             string
+		ReaderFunc       func() (io.Reader, func(), error)
+		ContentLength    int64
+		ExpectedReadFrom bool
 	}{
 		{
-			Name: "basic",
+			Name:             "file, length",
+			ReaderFunc:       newFileFunc,
+			ContentLength:    1024,
+			ExpectedReadFrom: true,
 		},
 		{
-			Name:   "buffer",
-			Buffer: true,
+			Name:       "file, no length",
+			ReaderFunc: newFileFunc,
 		},
 		{
-			Name:              "chunked",
-			SkipContentLength: true,
+			Name:          "file, negative length",
+			ReaderFunc:    newFileFunc,
+			ContentLength: -1,
+		},
+		{
+			Name:          "buffer",
+			ContentLength: 1024,
+			ReaderFunc:    newBufferFunc,
+		},
+		{
+			Name:       "buffer, no length",
+			ReaderFunc: newBufferFunc,
+		},
+		{
+			Name:          "buffer, length -1",
+			ContentLength: -1,
+			ReaderFunc:    newBufferFunc,
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.Name, func(t *testing.T) {
+			r, cleanup, err := tc.ReaderFunc()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			defer cleanup()
+
 			tConn := &testMockTCPConn{}
 			trFunc := func(tr *Transport) {
 				tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -5151,52 +5180,12 @@ func TestTransportRequestBodyCallsReadFrom(t *testing.T) {
 			)
 			defer cst.close()
 
-			f, err := ioutil.TempFile("", "net-http-test")
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			defer os.Remove(f.Name())
-
-			// 1K zeros just to get a file that we can read
-			_, err = f.Write(make([]byte, 1024))
-			f.Close()
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			f, err = os.Open(f.Name())
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			defer f.Close()
-
-			fi, err := f.Stat()
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			var r io.Reader
-			if tc.Buffer {
-				buf, err := ioutil.ReadAll(f)
-				if err != nil {
-					t.Fatal(err)
-				}
-
-				r = bytes.NewBuffer(buf)
-			} else {
-				r = f
-			}
-
 			req, err := NewRequest("PUT", cst.ts.URL, r)
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			if !tc.SkipContentLength {
-				req.ContentLength = fi.Size()
-			}
+			req.ContentLength = tc.ContentLength
 
 			req.Header.Set("Content-Type", "application/octet-stream")
 
@@ -5210,16 +5199,12 @@ func TestTransportRequestBodyCallsReadFrom(t *testing.T) {
 				t.Fatalf("status code = %d; want 200", resp.StatusCode)
 			}
 
-			if !tConn.ReadFromCalled {
-				t.Fatalf("ReadFrom never called during request body write")
+			if !tConn.ReadFromCalled && tc.ExpectedReadFrom {
+				t.Fatalf("expected ReadFrom to be called, but it wasn't")
 			}
 
-			if tConn.ActualInfo == nil {
-				t.Fatalf("no file info was logged during request body write")
-			}
-
-			if !reflect.DeepEqual(fi, tConn.ActualInfo) {
-				t.Fatalf("file info mismatch: expected %#v, got %#v", fi, tConn.ActualInfo)
+			if tConn.ReadFromCalled && !tc.ExpectedReadFrom {
+				t.Fatalf("ReadFrom called when it wasn't expected to be")
 			}
 		})
 	}

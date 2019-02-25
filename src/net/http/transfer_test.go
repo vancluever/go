@@ -113,7 +113,7 @@ func TestTransferWriterWriteBodyReaderTypes(t *testing.T) {
 	bufferTyp := reflect.TypeOf(&bytes.Buffer{})
 
 	newFileFunc := func() (io.Reader, func(), error) {
-		f, err := ioutil.TempFile("", "net-http-test-transferwriter")
+		f, err := ioutil.TempFile("", "net-http-testtransferwriterwritebodyreadertypes")
 		if err != nil {
 			return nil, nil, err
 		}
